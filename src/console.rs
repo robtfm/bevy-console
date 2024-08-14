@@ -346,7 +346,9 @@ pub(crate) fn console_ui(
     mut console_open: ResMut<ConsoleOpen>,
 ) {
     let keyboard_input_events = keyboard_input_events.read().collect::<Vec<_>>();
-    let ctx = egui_context.ctx_mut();
+    let Some(ctx) = egui_context.try_ctx_mut() else {
+        return;
+    };
 
     let pressed = keyboard_input_events
         .iter()
