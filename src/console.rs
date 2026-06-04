@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::hash::BuildHasher;
 use std::marker::PhantomData;
 use std::mem;
+use std::sync::Arc;
 use trie_rs::Trie;
 
 use crate::{
@@ -40,6 +41,17 @@ pub trait NamedCommand {
     /// Return the unique command identifier (same as the command "executable")
     fn name() -> &'static str;
 }
+
+/// A sink for a command invocation's textual result.
+///
+/// When a command is invoked programmatically (e.g. from a scene via
+/// `op_console_command` or the browser bridge) the invoker attaches a responder so it
+/// can await the result directly instead of scraping [`PrintConsoleLine`] output.
+/// When present, [`ConsoleCommand`]'s reply methods resolve this responder with the
+/// command's reply text (`Ok` for success, `Err` for failure) instead of writing
+/// console lines. When absent (e.g. a command typed into the in-game console) the
+/// reply methods write [`PrintConsoleLine`] events as before.
+pub type ConsoleResponder = Arc<dyn Fn(Result<String, String>) + Send + Sync>;
 
 /// Executed parsed console command.
 ///
@@ -67,52 +79,116 @@ pub trait NamedCommand {
 ///     }
 /// }
 /// ```
-pub struct ConsoleCommand<'w, T> {
-    command: Option<Result<T, clap::Error>>,
+pub struct ConsoleCommand<'w, 's, T> {
+    /// Un-consumed matching invocations for this frame. `take()` pops from the front;
+    /// whatever is left over is re-emitted by the [`SystemParam`] `apply` step so it is
+    /// handled on a subsequent frame.
+    queue: &'s mut VecDeque<ConsoleCommandEntered>,
+    /// Responder bound to the most recently [`take`](Self::take)n invocation.
+    responder: Option<ConsoleResponder>,
+    /// Reply lines buffered for the responder (joined when the command completes).
+    buffer: Vec<String>,
     console_line: EventWriter<'w, PrintConsoleLine>,
+    marker: PhantomData<T>,
 }
 
-impl<T> ConsoleCommand<'_, T> {
-    /// Returns Some(T) if the command was executed and arguments were valid.
+impl<T: Command> ConsoleCommand<'_, '_, T> {
+    /// Returns `Some(Ok(T))` for the next pending invocation of this command, or `None`
+    /// when none remain this frame. Each call rebinds the responder and reply buffer to
+    /// that invocation.
     ///
-    /// This method should only be called once.
-    /// Consecutive calls will return None regardless if the command occurred.
+    /// A single-execution handler calls this once and the remaining invocations are
+    /// carried to the next frame; a handler that wants to process every concurrent
+    /// invocation in one frame can drive it with `while let Some(Ok(cmd)) = cmd.take()`.
+    ///
+    /// Invocations that fail to parse are reported (to their responder, or the console)
+    /// and skipped, so this never yields `Some(Err(_))` — the `Result` is retained only
+    /// for source compatibility.
     pub fn take(&mut self) -> Option<Result<T, clap::Error>> {
-        mem::take(&mut self.command)
+        while let Some(entered) = self.queue.pop_front() {
+            let clap_command = T::command().no_binary_name(true);
+            let parsed = match clap_command.try_get_matches_from(entered.args.iter()) {
+                Ok(matches) => T::from_arg_matches(&matches),
+                Err(err) => Err(err),
+            };
+            match parsed {
+                Ok(value) => {
+                    self.responder = entered.responder;
+                    self.buffer.clear();
+                    return Some(Ok(value));
+                }
+                Err(err) => self.report_parse_error(entered.responder, err),
+            }
+        }
+        None
     }
 
-    /// Print `[ok]` in the console.
+    /// Report a parse failure to the invocation's responder, or echo it to the console.
+    fn report_parse_error(&mut self, responder: Option<ConsoleResponder>, err: clap::Error) {
+        if let Some(responder) = responder {
+            responder(Err(err.to_string()));
+        } else {
+            self.console_line
+                .write(PrintConsoleLine::new(err.to_string()));
+        }
+    }
+
+    /// Take the responder for this invocation so the result can be resolved later
+    /// (e.g. from an async system once a deferred operation completes). After this
+    /// returns `Some`, the reply methods on this struct fall back to writing
+    /// [`PrintConsoleLine`] events.
+    pub fn take_responder(&mut self) -> Option<ConsoleResponder> {
+        self.responder.take()
+    }
+
+    fn resolve(&mut self, success: bool) {
+        if let Some(responder) = self.responder.take() {
+            let payload = mem::take(&mut self.buffer).join("\n");
+            responder(if success { Ok(payload) } else { Err(payload) });
+        } else {
+            let sentinel = if success { "[ok]" } else { "[failed]" };
+            self.console_line
+                .write(PrintConsoleLine::new(sentinel.into()));
+        }
+    }
+
+    /// Complete the command successfully: resolves the responder with `Ok`, or prints
+    /// `[ok]` to the console.
     pub fn ok(&mut self) {
-        self.console_line
-            .write(PrintConsoleLine::new("[ok]".into()));
+        self.resolve(true);
     }
 
-    /// Print `[failed]` in the console.
+    /// Complete the command unsuccessfully: resolves the responder with `Err`, or
+    /// prints `[failed]` to the console.
     pub fn failed(&mut self) {
-        self.console_line
-            .write(PrintConsoleLine::new("[failed]".into()));
+        self.resolve(false);
     }
 
-    /// Print a reply in the console.
+    /// Add a reply line. With a responder present the line is buffered and delivered
+    /// when the command completes; otherwise it is written to the console immediately.
     ///
     /// See [`reply!`](crate::reply) for usage with the [`format!`] syntax.
     pub fn reply(&mut self, msg: impl Into<String>) {
-        self.console_line.write(PrintConsoleLine::new(msg.into()));
+        if self.responder.is_some() {
+            self.buffer.push(msg.into());
+        } else {
+            self.console_line.write(PrintConsoleLine::new(msg.into()));
+        }
     }
 
-    /// Print a reply in the console followed by `[ok]`.
+    /// Add a reply line followed by completing successfully.
     ///
     /// See [`reply_ok!`](crate::reply_ok) for usage with the [`format!`] syntax.
     pub fn reply_ok(&mut self, msg: impl Into<String>) {
-        self.console_line.write(PrintConsoleLine::new(msg.into()));
+        self.reply(msg);
         self.ok();
     }
 
-    /// Print a reply in the console followed by `[failed]`.
+    /// Add a reply line followed by completing unsuccessfully.
     ///
     /// See [`reply_failed!`](crate::reply_failed) for usage with the [`format!`] syntax.
     pub fn reply_failed(&mut self, msg: impl Into<String>) {
-        self.console_line.write(PrintConsoleLine::new(msg.into()));
+        self.reply(msg);
         self.failed();
     }
 }
@@ -121,12 +197,15 @@ pub struct ConsoleCommandState<T> {
     #[allow(clippy::type_complexity)]
     event_reader: <ConsoleCommandEnteredReaderSystemParam as SystemParam>::State,
     console_line: <PrintConsoleLineWriterSystemParam as SystemParam>::State,
+    /// Invocations read but not yet consumed by `take()`. Refilled from the event stream
+    /// each run; any leftovers are re-emitted in `apply` to be retried next frame.
+    queue: VecDeque<ConsoleCommandEntered>,
     marker: PhantomData<T>,
 }
 
-unsafe impl<T: Command> SystemParam for ConsoleCommand<'_, T> {
+unsafe impl<T: Command> SystemParam for ConsoleCommand<'_, '_, T> {
     type State = ConsoleCommandState<T>;
-    type Item<'w, 's> = ConsoleCommand<'w, T>;
+    type Item<'w, 's> = ConsoleCommand<'w, 's, T>;
 
     fn init_state(world: &mut World, system_meta: &mut SystemMeta) -> Self::State {
         let event_reader = ConsoleCommandEnteredReaderSystemParam::init_state(world, system_meta);
@@ -134,6 +213,7 @@ unsafe impl<T: Command> SystemParam for ConsoleCommand<'_, T> {
         ConsoleCommandState {
             event_reader,
             console_line,
+            queue: VecDeque::new(),
             marker: PhantomData,
         }
     }
@@ -151,50 +231,59 @@ unsafe impl<T: Command> SystemParam for ConsoleCommand<'_, T> {
             world,
             change_tick,
         );
-        let mut console_line = PrintConsoleLineWriterSystemParam::get_param(
+        let console_line = PrintConsoleLineWriterSystemParam::get_param(
             &mut state.console_line,
             system_meta,
             world,
             change_tick,
         );
 
-        let command = event_reader.read().find_map(|command| {
-            if T::name() == command.command_name {
-                let clap_command = T::command().no_binary_name(true);
-                // .color(clap::ColorChoice::Always);
-                let arg_matches = clap_command.try_get_matches_from(command.args.iter());
-
-                debug!(
-                    "Trying to parse as `{}`. Result: {arg_matches:?}",
-                    command.command_name
-                );
-
-                match arg_matches {
-                    Ok(matches) => {
-                        return Some(T::from_arg_matches(&matches));
-                    }
-                    Err(err) => {
-                        console_line.write(PrintConsoleLine::new(err.to_string()));
-                        return Some(Err(err));
-                    }
-                }
+        // Queue any newly-arrived invocations of this command. `take()` drains them;
+        // parsing is deferred until then so a parse error only consumes its own entry.
+        for entered in event_reader.read() {
+            if T::name() == entered.command_name {
+                state.queue.push_back(entered.clone());
             }
-            None
-        });
+        }
 
         ConsoleCommand {
-            command,
+            queue: &mut state.queue,
+            responder: None,
+            buffer: Vec::new(),
             console_line,
+            marker: PhantomData,
+        }
+    }
+
+    fn apply(state: &mut Self::State, _system_meta: &SystemMeta, world: &mut World) {
+        // Re-emit invocations the handler did not consume this run, so they are retried
+        // next frame (and keep the `have_commands` run condition alive until drained).
+        if !state.queue.is_empty() {
+            world.send_event_batch(state.queue.drain(..));
         }
     }
 }
 /// Parsed raw console command into `command` and `args`.
-#[derive(Clone, Debug, Event)]
+#[derive(Clone, Event)]
 pub struct ConsoleCommandEntered {
     /// the command definition
     pub command_name: String,
     /// Raw parsed arguments
     pub args: Vec<String>,
+    /// Optional sink for the command's textual result. Present when the command was
+    /// invoked programmatically (so the invoker can await the result directly); absent
+    /// for commands typed into the in-game console.
+    pub responder: Option<ConsoleResponder>,
+}
+
+impl std::fmt::Debug for ConsoleCommandEntered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsoleCommandEntered")
+            .field("command_name", &self.command_name)
+            .field("args", &self.args)
+            .field("responder", &self.responder.is_some())
+            .finish()
+    }
 }
 
 /// Events to print to the console.
@@ -706,7 +795,11 @@ fn handle_enter(
                 let command = config.commands.get(command_name.as_str());
 
                 if command.is_some() {
-                    command_entered.write(ConsoleCommandEntered { command_name, args });
+                    command_entered.write(ConsoleCommandEntered {
+                        command_name,
+                        args,
+                        responder: None,
+                    });
                 } else {
                     debug!(
                         "Command not recognized, recognized commands: `{:?}`",
