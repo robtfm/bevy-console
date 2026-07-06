@@ -3,8 +3,11 @@
 
 use bevy::prelude::*;
 pub use bevy_console_derive::ConsoleCommand;
+#[cfg(feature = "ui")]
 use bevy_egui::{EguiContextPass, EguiPlugin, EguiPreUpdateSet};
-use console::{block_keyboard_input, block_mouse_input, ConsoleCache};
+use console::ConsoleCache;
+#[cfg(feature = "ui")]
+use console::{block_keyboard_input, block_mouse_input};
 use trie_rs::TrieBuilder;
 
 use crate::commands::clear::{clear_command, ClearCommand};
@@ -16,10 +19,12 @@ pub use crate::console::{
 };
 pub use crate::log::*;
 
-use crate::console::{console_ui, receive_console_line, ConsoleState};
+use crate::console::ConsoleState;
+#[cfg(feature = "ui")]
+use crate::console::{console_ui, receive_console_line};
 pub use clap;
 
-// mod color;
+#[cfg(feature = "ui")]
 mod color;
 mod commands;
 mod console;
@@ -48,6 +53,7 @@ pub enum ConsoleSet {
 }
 
 /// Run condition which does not run any command systems if no command was entered
+#[cfg(feature = "ui")]
 fn have_commands(commands: EventReader<ConsoleCommandEntered>) -> bool {
     !commands.is_empty()
 }
@@ -78,8 +84,11 @@ impl Plugin for ConsolePlugin {
             .add_console_command::<ExitCommand, _>(exit_command)
             .add_console_command::<HelpCommand, _>(help_command)
             // after per-command startup
-            .add_systems(Startup, init.after(ConsoleSet::Startup))
-            .add_systems(
+            .add_systems(Startup, init.after(ConsoleSet::Startup));
+
+        #[cfg(feature = "ui")]
+        {
+            app.add_systems(
                 PreUpdate,
                 (block_mouse_input, block_keyboard_input)
                     .after(EguiPreUpdateSet::ProcessInput)
@@ -102,12 +111,13 @@ impl Plugin for ConsolePlugin {
                 ),
             );
 
-        // Don't initialize an egui plugin if one already exists.
-        // This can happen if another plugin is using egui and was installed before us.
-        if !app.is_plugin_added::<EguiPlugin>() {
-            app.add_plugins(EguiPlugin {
-                enable_multipass_for_primary_context: true,
-            });
+            // Don't initialize an egui plugin if one already exists.
+            // This can happen if another plugin is using egui and was installed before us.
+            if !app.is_plugin_added::<EguiPlugin>() {
+                app.add_plugins(EguiPlugin {
+                    enable_multipass_for_primary_context: true,
+                });
+            }
         }
     }
 }
